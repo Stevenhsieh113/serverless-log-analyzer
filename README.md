@@ -52,21 +52,3 @@ AI 依上述決定產出解析器、Gateway、分析器、命令列、MCP Server
 ```
 
 涵蓋的情況包括：日誌解析、記憶體與 timeout 的門檻、有無 GSI 時的節流說明、moto 模擬成功與資源不存在、命令列輸出，以及 MCP tool 回傳同一份發現。目前 26 項測試通過。
-
-## MCP 加分項怎麼接上 Cursor
-
-Cursor 是 MCP client。這個專案的 server 是 `server.py`。在 Cursor 的 MCP 設定加入：
-
-```json
-{
-  "mcpServers": {
-    "aiops": {
-      "command": "C:\\Users\\USER\\OneDrive\\桌面\\科技輔助\\aiops\\.venv\\Scripts\\python.exe",
-      "args": ["C:\\Users\\USER\\OneDrive\\桌面\\科技輔助\\aiops\\server.py"],
-      "env": {"AIOPS_MODE": "fixture"}
-    }
-  }
-}
-```
-
-接上之後可以問：「幫我分析這個應用的最新日誌，並找出負載過高的原因。」模型會呼叫上述 tool，得到和命令列相同的三個發現。
