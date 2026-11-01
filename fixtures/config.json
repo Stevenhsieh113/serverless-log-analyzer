@@ -1,0 +1,7 @@
+{
+  "function_name": "checkout",
+  "memory_mb": 128,
+  "timeout_seconds": 30,
+  "table_name": "orders",
+  "api_token": "super-secret-token"
+}

@@ -1,0 +1,4 @@
+START RequestId: 7c1e2a10-1111-2222-3333-444455556666 Version: $LATEST
+[ERROR] ProvisionedThroughputExceededException: The level of configured provisioned throughput for the table was exceeded. Table: orders
+REPORT RequestId: 7c1e2a10-1111-2222-3333-444455556666	Duration: 29120.50 ms	Billed Duration: 29121 ms	Memory Size: 128 MB	Max Memory Used: 127 MB
+garbage %%% not a log event

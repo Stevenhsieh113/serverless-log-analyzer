@@ -1,0 +1,8 @@
+{
+  "table_name": "orders",
+  "billing_mode": "PROVISIONED",
+  "keys": [
+    {"name": "order_id", "type": "S", "role": "HASH"}
+  ],
+  "global_secondary_indexes": []
+}

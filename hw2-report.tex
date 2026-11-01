@@ -1,0 +1,279 @@
+\documentclass[11pt]{article}
+
+\usepackage{xeCJK}
+\setCJKmainfont{Noto Serif CJK TC}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\geometry{a4paper, margin=2.4cm}
+\hypersetup{colorlinks=true, urlcolor=blue, linkcolor=black}
+\setlist{itemsep=0.25em, topsep=0.4em}
+
+\title{HW2: AI-Assisted Programming Project\\雲端日誌分析助手}
+\author{請在此填上姓名、學號}
+\date{2026 年 10 月}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+
+這份作業我做的是一個給無伺服器應用除錯用的日誌分析工具，專案名稱放在 \texttt{aiops} 目錄。它要處理的情況很具體：一個使用 AWS Lambda 與 DynamoDB 的應用變慢或失敗時，記憶體與 timeout 寫在函式設定和 CloudWatch 的 \texttt{REPORT} 行裡，資料表有沒有合適的索引則寫在 DynamoDB 的 schema 裡，節流錯誤又出現在另一段日誌。這三邊平常要開三個主控台頁面對照。這個工具把設定、schema 與日誌收成同一份發現，並在終端機直接印出。
+
+作業要求產品本身可以獨立運作，並在報告裡說明專案目的、與 AI 的協作方式，以及如何把軟體工程實踐（例如單元測試）做進產品。MCP Server 是加分項，規定是把已經做好的功能包成 agent 可以呼叫的 tool。因此我把命令列 \texttt{cli.py analyze} 當成產品入口，\texttt{server.py} 只是同一支分析的第二個入口，沒有另寫一套判斷規則。
+
+預設執行模式是 \texttt{fixture}。程式讀取專案內建的事故樣本，不需要 AWS 帳號，也不會產生雲端費用。同一套 Gateway 介面在 \texttt{AIOPS\_MODE=live} 時改呼叫 boto3，讀取真實的 S3、DynamoDB 與 CloudWatch Logs。單元測試用 moto 模擬這三個 API，所以驗收時不必連上真實帳號。我另外在 AWS 免費額度內建立過一次最小的 Lambda，只為了核對真實 \texttt{REPORT} 行的欄位，看完後已將函式與 log group 刪除。
+
+這份報告依作業模板的順序撰寫：先說明目的與這個工具實際解決的困境，再寫我如何與 AI 分工、如何驗收，最後說明分層、測試與 MCP 包裝。文中的數字，例如 26 項測試、記憶體 95\% 與執行時間 85\% 的門檻，都是這個專案自己的設計與執行結果，不是外界公布的評分規準。
+
+\section{Your project's purpose}
+
+\subsection{要解決的困境}
+
+建置 Lambda、DynamoDB、API Gateway 這類無伺服器架構時，除錯很少只發生在一個地方。函式的記憶體與 timeout 在設定裡，實際用了多少記憶體、跑了多久，要等 CloudWatch Logs 出現 \texttt{REPORT} 行才知道。若錯誤是 \texttt{ProvisionedThroughputExceededException}，還要再打開 DynamoDB，看資料表的主鍵與 Global Secondary Index（GSI）能不能對上查詢。這三份資料的格式不同，頁面也不同，來回切換很花時間，而且很容易只看到「有一行 ERROR」，卻沒把設定與 schema 接上。
+
+這個專案把上述來回查詢收成一次分析。它不試圖診斷所有效能問題，也不把每一行一般程式例外都列成結論。它回答的問題是：這次負載過高，是否表現成記憶體打滿、執行時間貼近 timeout、任務已經逾時，或 DynamoDB 被節流。Lambda 的 \texttt{REPORT} 行沒有 CPU 使用率百分比；在 Lambda 上，配置的記憶體與可用的 CPU 成正比，所以這個工具用記憶體使用比例與執行時間來判斷負載，再另外讀取節流錯誤與資料表索引。
+
+\subsection{產品做什麼}
+
+使用者在 \texttt{aiops} 目錄執行：
+
+\begin{verbatim}
+.venv\Scripts\python cli.py analyze
+\end{verbatim}
+
+預設會分析名為 \texttt{checkout} 的應用。輸出為：
+
+\begin{verbatim}
+模式：fixture
+資料來源：fixtures/config.json、fixtures/schema.json、fixtures/logs.txt
+應用 checkout 的分析結果
+1. 記憶體打滿：上限 128 MB，日誌 Max Memory Used 127 MB。
+2. 執行時間貼近 timeout：上限 30 秒，日誌 Duration 29120.5 ms。
+3. DynamoDB 被節流：資料表 orders 沒有 GSI，日誌出現
+   ProvisionedThroughputExceeded。
+\end{verbatim}
+
+三條發現分別來自三個地方，而且每一條都留有證據原文。第一條與第二條來自 \texttt{REPORT} 行的數字，並與設定檔中的記憶體、timeout 對照。第三條同時使用日誌中的例外名稱，以及 schema 裡的 GSI 清單。若資料表已經有 GSI，措辭會改成只陳述發生節流，不會聲稱「沒有 GSI」。這個差別有對應的單元測試。
+
+事故樣本是三個很小的文字檔，放在 \texttt{fixtures/}：
+
+\begin{itemize}
+    \item \texttt{config.json}：Lambda 函式 \texttt{checkout}，記憶體 128 MB，timeout 30 秒，使用資料表 \texttt{orders}。其中的 \texttt{api\_token} 是故意放進去的假秘密，回傳前會被遮成 \texttt{***}。
+    \item \texttt{schema.json}：資料表只有分割鍵 \texttt{order\_id}，\texttt{global\_secondary\_indexes} 是空陣列，計費模式為 \texttt{PROVISIONED}。
+    \item \texttt{logs.txt}：四行文字。一行 \texttt{START}，一行 DynamoDB 節流錯誤，一行 \texttt{REPORT}（執行 29120.50 ms、記憶體上限 128 MB、實際使用 127 MB），以及一行故意寫壞的亂碼。
+\end{itemize}
+
+樣本合計只有數 KB。它的作用是讓每次執行與每次測試都看到同一件事故，結果可以重現。\texttt{fixture} 模式會固定回傳這組樣本；命令列上的 bucket、資料表名稱只在 \texttt{live} 模式才會拿去呼叫 AWS。
+
+\subsection{四種會被報出來的訊號}
+
+分析器只把下列情況收成發現。門檻寫在 \texttt{analyzer.py} 的 \texttt{MEMORY\_RATIO = 0.95} 與 \texttt{TIMEOUT\_RATIO = 0.85}，是本專案自訂的，不是 AWS 文件規定的服務水準。
+
+\begin{center}
+\begin{tabular}{lp{8.6cm}}
+\toprule
+日誌或設定中的內容 & 發現 \\
+\midrule
+\texttt{Max Memory Used} 達到該次 \texttt{Memory Size} 的 95\% 以上 & 記憶體打滿 \\
+\texttt{Duration} 達到設定 timeout 的 85\% 以上 & 執行時間貼近 timeout \\
+出現 \texttt{Task timed out} & Lambda 任務逾時 \\
+出現 \texttt{ProvisionedThroughputExceeded} & DynamoDB 被節流；若 schema 沒有 GSI，會寫進同一條 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+用這次事故的數字可以手算。記憶體 \(127 / 128 \approx 0.992\)，高於 0.95，所以成立。執行時間 29120.5 ms，timeout 為 30 秒，85\% 的位置是 25500 ms，29120.5 更高，所以成立。測試也檢查了門檻的另一側：使用 121 MB 時 \(121 / 128 \approx 0.945\)，不報記憶體；使用 122 MB 時約 0.953，會報。執行 25000 ms 不報貼近 timeout，29120.5 ms 會報。這樣寫是為了避免門檻只在樣本那一個數字上碰巧通過。
+
+一般程式錯誤，例如 \texttt{RuntimeError}，解析器會把它分類成 \texttt{error}，但分析器不會把它列成發現。原因是這個產品要回答的是負載問題，而不是把 CloudWatch 裡所有例外再列一遍。演示時可以說明：例外有被認出來，結論只收和負載有關的訊號。
+
+\subsection{和一次真實 CloudWatch 日誌的對照}
+
+為了確認樣本不是自創的格式，我在 AWS 免費額度內建立了一個最小函式 \texttt{log-sample}（Python 3.12，記憶體維持預設 128 MB），用 \texttt{print} 印出一行 \texttt{ProvisionedThroughputExceededException}，按一次 Test，再到 CloudWatch 的 log group \texttt{/aws/lambda/log-sample} 查看。Lambda 平台自己寫入 \texttt{START}、\texttt{END} 與 \texttt{REPORT}。該次 \texttt{REPORT} 的重點是：
+
+\begin{verbatim}
+Duration: 1.36 ms
+Billed Duration: 2 ms
+Memory Size: 128 MB
+Max Memory Used: 33 MB
+Init Duration: 135.94 ms
+\end{verbatim}
+
+\IfFileExists{cloudwatch-log.png}{%
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.92\textwidth]{cloudwatch-log.png}
+    \caption{函式 log-sample 單次測試在 CloudWatch Logs 中的四行紀錄。中間的節流訊息由測試程式印出；START、END 與 REPORT 由 Lambda 平台寫入。}
+\end{figure}
+}{%
+\noindent（繳交 PDF 前，請將該次 CloudWatch 截圖上傳到 Overleaf，檔名設為 \texttt{cloudwatch-log.png}，重新編譯後圖會出現在此處。）
+}
+
+這次真實執行只用了 33 MB、跑了 1.36 ms。若把這份日誌交給分析器，不會得到「記憶體打滿」或「貼近 timeout」。\texttt{Init Duration: 135.94 ms} 表示冷啟動。解析器的規則允許這個欄位出現在 \texttt{Duration} 與 \texttt{Memory Size} 之間，仍然抽得到後面的記憶體數字；這也有一項單元測試，使用的是另一組數字（256 MB 與 40 MB），避免和事故樣本綁死。看完日誌後，我刪除了該函式與對應的 log group，避免日誌繼續佔用保存空間。Lambda 每月免費額度包含 100 萬次請求與 400{,}000 GB-秒，CloudWatch Logs 每月另有 5 GB 的寫入與保存額度；這一次測試遠低於這些上限。
+
+因此，專案的特色不是「用 AI 自由解讀任何日誌」，而是先把三種 AWS 資料收成可核對的欄位，再只對四種負載訊號下結論。命令列沒有模型也能印出同一份結果。對話框裡的模型若要回答「幫我分析這個應用的最新日誌，並找出負載過高的原因」，應呼叫 MCP tool，取得這份 JSON，而不是自己猜測 CPU 數字。
+
+\section{How you collaborate with AI}
+
+這份作業在 Cursor 裡與 AI 一起完成。我的角色是選定題目、縮小範圍、規定哪些事情先不做，並用測試輸出與真實日誌核對結果。AI 的角色是依這些決定撰寫程式、測試與報告草稿。我沒有把第一次生成的程式直接當成最終答案，中間多次把範圍問清楚之後才讓實作開始。
+
+\subsection{我先定下來的限制}
+
+題目原本把整個系統描述成一個 AIOps MCP Server。對照作業 PDF 之後，我要求把產品與加分項分開：命令列必須在不開啟 Cursor 的情況下完成分析，MCP 只能包裝既有函式。另外幾項是我在對話中明確講過的：
+
+\begin{itemize}
+    \item 先做本地事故樣本，單元測試不准依賴真實 AWS，避免帳號與費用變成驗收條件。
+    \item 樣本只保留對得出原因的那幾行，不存放整段 CloudWatch 匯出。
+    \item Git 與 GitHub 留到程式和報告完成後再處理，實作過程不要為了留下 commit 而拆天進行。
+    \item 對話紀錄先不要匯出。需要繳交協作紀錄時，再從 Cursor 的 agent transcript 整理成可讀文件。
+    \item 家目錄 \texttt{C:\textbackslash Users\textbackslash USER} 裡有一個尚未使用的 Git 倉庫，專案不可以 commit 到那裡。作業應使用獨立的 \texttt{aiops} 目錄。
+\end{itemize}
+
+這些限制改變了架構。若一開始就把 boto3 寫進 tool 函式，沒有網路就無法測試，也無法在課堂上穩定演示。現在讀檔與呼叫 AWS 都集中在 Gateway，解析與判斷是純函式。
+
+\subsection{協作時我實際追問過的問題}
+
+實作開始之後，我不是只要求「繼續寫」，而是針對看不懂或可能講錯的地方追問。這些問題後來都反映在程式或報告的寫法上。
+
+\begin{itemize}
+    \item 事故樣本是什麼、要放在哪個路徑、會不會佔用很大的空間。結論是三個文字檔放在 \texttt{fixtures/}，體積是數 KB。
+    \item 日誌解析在做什麼。結論是把一行 \texttt{REPORT} 拆成執行時間與記憶體數字，把節流、逾時與其他例外分成不同種類，並略過 \texttt{START} 與亂碼。
+    \item 測試裡寫死的 127 是不是為了對照樣本檔。結論是該測試自己帶了一行日誌，127 是那一行裡的 \texttt{Max Memory Used}；它沒有打開 \texttt{fixtures/logs.txt}。真正讀樣本檔的是另一項測試，而且只檢查事件種類與順序。
+    \item 沒有正在運行的服務時，CloudWatch 沒有日誌，如何在不付費的前提下看到真實格式。結論是只建立一個 Lambda、測試一次、看完即刪除函式與 log group。
+    \item 26 是不是公認的評分標準。結論是那只是 pytest 收集到的測試函式數量，不能寫成業界標準。95\% 與 85\% 也是本專案自訂門檻。
+    \item 這個工具是否只能處理記憶體問題，以及一般程式錯誤要不要納入結論。結論是記憶體、timeout、逾時與 DynamoDB 節流都會報；一般 \texttt{RuntimeError} 只分類、不列入發現。
+\end{itemize}
+
+我把這些問答本身視為協作的一部分。AI 最初的說明若把測試數字和樣本檔綁在一起，或把 26 講得像標準，是在後續問答裡被改正的。驗收時我看的是 \texttt{pytest} 是否通過，以及 \texttt{cli.py analyze} 是否印出上述三句中文結論，而不是只看程式有沒有被生成出來。
+
+\subsection{分工與留下的紀錄}
+
+程式、單元測試與這份報告草稿由 Cursor 的 agent 依上述決定產生，使用的程式語言是 Python 3.11。我負責指定目錄、確認樣本內容、閱讀 \texttt{test\_log\_parser.py} 並核對自己的理解，以及在 AWS 主控台完成一次真實日誌對照。完整對話存在本機的 agent transcript，檔名對應這次作業對話。該檔是 JSONL，裡面同時含有工具呼叫，不適合直接當附件；繳交前可再整理成只保留問答的 Markdown。到撰寫本報告時，我尚未把紀錄匯出，也尚未建立作業用的 GitHub 倉庫。
+
+\section{How you integrate software engineering practice into your product}
+
+\subsection{分層}
+
+若把讀取 AWS、解析文字與下結論寫在同一個函式裡，測試就必須準備真實雲端或整段複製貼上的回應，稍後 MCP 也容易再複製一份判斷。這個專案把產品分成穩定的邊界，命令列與 MCP 都呼叫同一支入口 \texttt{service.recent\_errors}。
+
+\begin{center}
+\begin{tabular}{lp{8.2cm}}
+\toprule
+模組 & 職責 \\
+\midrule
+\texttt{log\_parser.py} & 純函式。輸入日誌文字，輸出事件清單，不讀檔、不連網路。 \\
+\texttt{gateway.py} & 唯一的資料邊界。\texttt{FixtureGateway} 讀樣本，\texttt{BotoGateway} 呼叫 AWS。 \\
+\texttt{analyzer.py} & 輸入設定、schema 與日誌原文，輸出發現清單。 \\
+\texttt{service.py} & 組合上述三者，並遮罩秘密欄位。 \\
+\texttt{cli.py} & 產品入口，印出給人讀的結果。 \\
+\texttt{server.py} & 加分項。三個 MCP tool 只轉呼叫 \texttt{service}。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+一次 \texttt{analyze} 的路徑是：\texttt{cli.py} 讀取參數，\texttt{service} 依環境變數 \texttt{AIOPS\_MODE} 建立 Gateway，取得設定、schema 與日誌，把設定裡名稱包含 token、password、secret、access key 或 private key 的欄位改成 \texttt{***}，再交給 \texttt{analyzer}。分析器內部才呼叫 \texttt{parse\_logs}。因此解析器的測試不需要 boto3，分析器的測試不需要 moto，只有 Gateway 的 AWS 測試需要模擬客戶端。
+
+\texttt{BotoGateway} 使用的 API 分別是 S3 \texttt{GetObject}、DynamoDB \texttt{DescribeTable}，以及 CloudWatch Logs \texttt{FilterLogEvents}。日誌群組名稱固定為 \texttt{/aws/lambda/\{function\}}，只取時間窗內最多 50 筆。資源不存在時，boto3 的 \texttt{ClientError} 會被轉成 \texttt{LookupError}，訊息裡帶有 bucket、資料表或 log group 名稱。\texttt{DescribeTable} 的回應會正規化成與 \texttt{schema.json} 相同的形狀：主鍵、GSI 與計費模式。這樣分析器不必分辨資料來自檔案還是 AWS。
+
+\subsection{單元測試與模擬}
+
+測試使用 pytest，雲端回應使用 moto 5 的 \texttt{mock\_aws}。moto 在行程內攔截 boto3，測試會自己建立 bucket、資料表與 log group，再斷言 Gateway 讀回的內容。執行時不需要 \texttt{AWS\_ACCESS\_KEY\_ID}，也不會打到網路上的 AWS。在 \texttt{aiops} 目錄執行：
+
+\begin{verbatim}
+.venv\Scripts\python -m pytest
+\end{verbatim}
+
+目前結果是 26 項通過。這 26 項是六支測試檔裡的測試函式數量，組成如下。
+
+\begin{center}
+\begin{tabular}{lrp{7.4cm}}
+\toprule
+檔案 & 項數 & 在保護什麼 \\
+\midrule
+\texttt{test\_log\_parser.py} & 6 & \texttt{REPORT} 數字、冷啟動欄位、節流／逾時／一般錯誤的分類、略過空行與壞行、空字串、樣本檔的事件順序 \\
+\texttt{test\_gateway.py} & 8 & 讀取樣本、GSI 正規化、moto 模擬 S3／DynamoDB／Logs 的成功路徑，以及物件、資料表、log group 不存在 \\
+\texttt{test\_analyzer.py} & 8 & 事故樣本的三個發現、健康日誌不報、兩個門檻的兩側、有 GSI 時不聲稱缺少索引、逾時、秘密遮罩、\texttt{fixture} 模式整條路徑 \\
+\texttt{test\_cli.py} & 1 & 子行程執行 \texttt{cli.py analyze}，標準輸出含三句結論且不含原始 token \\
+\texttt{test\_server.py} & 3 & 三個 tool 分別回傳遮罩後的設定、沒有 GSI 的 schema，以及同一組發現代碼 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+以解析測試為例，\texttt{test\_parses\_report\_memory\_and\_duration} 先在測試檔內寫好一行 \texttt{REPORT}，再斷言 \texttt{duration\_ms} 是 29120.50、\texttt{memory\_size\_mb} 是 128、\texttt{max\_memory\_used\_mb} 是 127。期望值寫死，是因為輸入就是這一行；解析器若把欄位抓錯，測試會失敗。同一檔案稍後的測試改用 256 MB 與 40 MB，用來證明程式是在讀當下那一行，而不是永遠回傳 127。最後一項才讀 \texttt{fixtures/logs.txt}，期望事件順序是先 \texttt{throttle}、再 \texttt{report}，\texttt{START} 與亂碼不出現。
+
+\texttt{test\_server.py} 是直接呼叫 tool 函式並檢查 JSON，用來保證 MCP 包裝沒有另外計算出一套發現。它還沒有代替「在 Cursor 對話框裡看到模型自行呼叫 tool」這件事。後者要把 \texttt{server.py} 登記進 Cursor 的 MCP 設定後，再開新對話提問才能看到。
+
+\subsection{MCP 包裝與使用方式}
+
+\texttt{server.py} 使用 Python MCP SDK 2 的 \texttt{MCPServer}（此版本已不再提供舊的 \texttt{FastMCP} 匯入路徑），以 stdio 啟動。登記的 tool 為：
+
+\begin{itemize}
+    \item \texttt{get\_s3\_config}：讀取設定並遮罩秘密。
+    \item \texttt{get\_dynamodb\_schema}：回傳主鍵、GSI 與計費模式。
+    \item \texttt{get\_recent\_lambda\_errors}：結合設定、schema 與近期日誌，回傳與命令列相同的發現。
+\end{itemize}
+
+Cursor 是現成的 MCP client，不需要自做一個對話框。在 Cursor 的 MCP 設定加入下列內容後，重新載入 MCP，再開一個新對話即可。路徑請依自己的電腦修改。
+
+\begin{verbatim}
+{
+  "mcpServers": {
+    "aiops": {
+      "command": "C:\\Users\\USER\\OneDrive\\桌面\\科技輔助\\aiops\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\Users\\USER\\OneDrive\\桌面\\科技輔助\\aiops\\server.py"],
+      "env": {"AIOPS_MODE": "fixture"}
+    }
+  }
+}
+\end{verbatim}
+
+可以問的句子是：「幫我分析這個應用的最新日誌，並找出負載過高的原因。」在 \texttt{fixture} 模式下，預期會看到模型呼叫上述 tool，並得到記憶體 127/128 MB、執行時間約 29120 ms、以及 \texttt{orders} 沒有 GSI 導致節流這三點。工具沒有提供寫入、刪除或修改雲端資源的操作。
+
+\subsection{重現方式與目前限制}
+
+在另一台已安裝 Python 3.11 的 Windows 電腦上，於 \texttt{aiops} 目錄執行：
+
+\begin{verbatim}
+python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python -m pytest
+.venv\Scripts\python cli.py analyze
+\end{verbatim}
+
+\texttt{requirements.txt} 包含 boto3、moto、pytest 與 mcp。虛擬環境目錄 \texttt{.venv} 已寫進 \texttt{.gitignore}，之後建立 Git 倉庫時不應提交依賴套件本體。
+
+目前刻意不做或尚未完成的部分也記在這裡，避免報告範圍大於程式：
+
+\begin{itemize}
+    \item \texttt{live} 模式的程式已寫好，但沒有對一個長期運行的正式應用做過線上演示。真實 AWS 只用來核對一次 \texttt{REPORT} 格式。
+    \item \texttt{fixture} 模式忽略傳入的 bucket 與資料表名稱，固定回傳內建樣本。
+    \item 不判斷 API Gateway 的 HTTP 5xx、主機 CPU 百分比，也不把一般程式例外列成負載發現。
+    \item Cursor 對話框中的實際 tool 呼叫，要等 MCP 設定貼上並重載之後才能演示。
+    \item 作業要求的 GitHub commit 紀錄尚未建立，將在程式與本報告定稿後，於 \texttt{aiops} 目錄單獨初始化，並依解析器、Gateway、分析器與命令列、MCP、報告分成數個 commit。
+\end{itemize}
+
+\section{Conclusion}
+
+這個專案解決的困境，是無伺服器應用出現負載問題時，必須在 S3 設定、DynamoDB schema 與 CloudWatch Logs 之間來回對照。工具把這三邊收成四種有證據的訊號：記憶體打滿、執行時間貼近 timeout、任務逾時，以及 DynamoDB 節流（並註明是否缺少 GSI）。命令列在離線樣本上已經能印出其中三項同時成立的事故；解析器也用我在 CloudWatch 看到的真實欄位做過格式對照。
+
+技術上我把可測試的邊界放在程式裡，而不是只在報告裡宣稱有做測試。解析不連網路，AWS 呼叫集中在 Gateway，判斷集中在分析器，命令列與 MCP 共用 \texttt{service.recent\_errors}。26 項 pytest 覆蓋解析、moto 模擬、門檻兩側、秘密遮罩與 tool 輸出。MCP 是這條既有路徑的包裝，用來回應作業的加分項。
+
+它的範圍維持在這一種除錯問題上。這樣寫的原因，是讓每一次輸出都能指回某一行 \texttt{REPORT}、某一行節流錯誤，或 schema 裡的索引清單。後續若要擴充，應沿同一條路徑增加訊號與測試，而不是在 tool 裡另寫一套只供對話框使用的判斷。
+
+\begin{thebibliography}{9}
+\bibitem{hw2}
+課程作業 HW2: AI-Assisted Programming Project。繳交內容包含專案目的、與 AI 的協作、軟體工程實踐；MCP Server 為加分項，須包裝既有功能。
+\bibitem{lambda-logs}
+AWS, \emph{Log and monitor Python Lambda functions}. \url{https://docs.aws.amazon.com/lambda/latest/dg/python-logging.html}
+\bibitem{lambda-price}
+AWS, \emph{AWS Lambda Pricing}. 免費額度包含每月 100 萬次請求與 400{,}000 GB-秒。\url{https://aws.amazon.com/lambda/pricing/}
+\bibitem{cw-price}
+AWS, \emph{Amazon CloudWatch Pricing}. Logs 免費額度包含每月 5 GB 寫入、保存與查詢掃描。\url{https://aws.amazon.com/cloudwatch/pricing/}
+\bibitem{moto}
+moto documentation. 以 \texttt{mock\_aws} 在測試中攔截 boto3。\url{https://docs.getmoto.org/}
+\end{thebibliography}
+
+\end{document}
